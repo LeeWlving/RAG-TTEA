@@ -1,0 +1,228 @@
+"""Implementation for Dynamic Greedy Embedding Attack (DGEA)."""
+import logging
+import random
+import re
+import os
+
+import torch
+import torch.nn as nn
+import numpy as np
+from langchain_core.prompts import ChatPromptTemplate
+import pandas as pd
+
+from tools.parse_response import parse_repeat_response
+
+from .base import KnowExAttack
+from tools.get_embedding import get_embedding
+from tools.get_llm import get_llm
+from tools.attacks import detect_refusal
+
+dgea_attack = ["DGEA"]
+
+
+class DGEA(KnowExAttack):
+    """
+    Dynamic Greedy Embedding Attack (DGEA).
+    Reference: https://arxiv.org/pdf/2409.08045
+    """
+
+    def __init__(self, args):
+        """
+        embedding_model, command_prompt, info_prompt, iterations=3, pool_size=512, allow_non_ascii=True,
+        parser_llm="gpt4o-mini", llm_kwargs={}
+        """
+        super().__init__(args)
+        self.embedding_model = get_embedding(args.emb_model)
+        self.embedding_dim = self.embedding_model.dim
+        self.embedding_space = []  # A collection of existing vectors (embeddings) that form the embedding space.
+        
+        # for greedy query optimization
+        self.command_prompt = args.command_prompt    # Instraction for reproducing
+        self.info_prompt = args.info_prompt    # Init info_prompt, for locating the query to some target document in database.
+
+        self.iterations = args.iterations  # Number of iterations for query optimization.
+        self.pool_size = args.pool_size  # tokens to sample from the total pool.
+        self.allow_non_ascii = args.allow_non_ascii  # Whether to allow non-ASCII characters in the token pool.
+        
+        self.tokenizer = self.embedding_model.tokenizer
+        self.device = self.embedding_model.device
+        self.embed_sentence = self.embedding_model._embed
+        self.control_toks = self.tokenizer.encode(self.info_prompt, add_special_tokens=False, return_tensors='pt')[0].to(self.device)
+        self.all_tokens = list(range(len(self.tokenizer)))
+        if not self.allow_non_ascii:
+            self.all_tokens = [tok for tok in self.all_tokens if self.tokenizer.decode([tok]).isascii()]
+        logging.info(f"Total tokens in tokenizer: {len(self.all_tokens)}")
+        
+        prompt_dir = os.environ.get("PROMPT_PATH")
+        with open(os.path.join(prompt_dir, self.command_prompt), 'r', encoding="utf-8") as f:
+            self.command_prompt = f.read()
+        with open(os.path.join(prompt_dir, self.info_prompt), 'r', encoding="utf-8") as f:
+            self.info_prompt = f.read()
+        
+        extra_dir = os.environ.get("EXTRA_PATH")
+        model_stats = args.random_vec.split(".")[0] + f"_wiki_{args.emb_model}.csv"
+        stats_path = os.path.join(extra_dir, model_stats)
+        if not os.path.exists(stats_path):
+            stats_path = os.path.join(extra_dir, args.random_vec)
+        vec_df = pd.read_csv(stats_path)
+        self.random_vec = self._get_distribution_of_embeddings(vec_df['mean'].values, vec_df['variance'].values, vectors_num=args.max_query)
+        
+
+    def get_query(self, query_id):
+        """
+        Get the adversarial query for a given query round.
+        Two processes:
+            1) Choose target embedding
+            2) Optimize the query info_prompt to approach the target embedding
+        """
+        # Choose target embedding
+        if query_id == 0 or len(self.embedding_space) == 0:
+            target_embedding = self.random_vec[query_id]    # TODO: to device
+        else: 
+            target_embedding = self._find_dissimilar_vector()
+        
+        # Optimize the query info_prompt to approach the target embedding
+        info_prompt, best_loss, best_embedding = self._optimize_query(target_embedding)
+        query = self.command_prompt.replace("<info>", info_prompt)
+        logging.info(f"Query {query_id}: {query}")
+        logging.info(f"Cosine to target_embedding: {1 - best_loss}")
+
+        # TODO: consider the logging system
+        return query
+
+    def _get_distribution_of_embeddings(self, mean_vector, variance_vector, vectors_num=100):
+        """
+        Generate a set of vectors based on a normal distribution of mean and variance vectors.
+
+        Args:
+            mean_vector (list or np.array): Mean vector for generating embeddings.
+            variance_vector (list or np.array): Variance vector for generating embeddings.
+            vectors_num (int): Number of vectors to generate.
+
+        Returns:
+            np.array: Generated vectors based on the distribution.
+        """
+        mean_vector = np.array(mean_vector)
+        variance_vector = np.array(variance_vector)
+        generated_vectors = []
+        for _ in range(vectors_num):
+            sampled_vector = np.random.normal(loc=mean_vector, scale=np.sqrt(variance_vector))
+            generated_vectors.append(sampled_vector)
+        return np.array(generated_vectors)
+
+        
+    def _find_dissimilar_vector(self):
+        """
+            Find a vector that is dissimilar to the existing set of vectors in the embedding space.
+            Use gradient-based optimization to find farthest vector.
+
+            Returns:
+                np.array: A vector that is dissimilar to the centroid of the embedding space.
+        """
+        embedding_space_tensor = torch.tensor(
+            self.embedding_space, dtype=torch.float32, device=self.device
+        ).reshape(-1, self.embedding_dim)
+        centroid = torch.mean(embedding_space_tensor, dim=0)
+        farthest_vector = torch.randn(
+            self.embedding_dim, device=self.device, requires_grad=True
+        )
+        farthest_vector = 0.6 * (farthest_vector - torch.min(farthest_vector)) / (
+                torch.max(farthest_vector) - torch.min(farthest_vector)) - 0.3
+        farthest_vector = farthest_vector.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([farthest_vector], lr=0.01)
+        loss_fn = torch.nn.CosineEmbeddingLoss()
+        for _ in range(30000):
+            optimizer.zero_grad()
+            target = torch.tensor([-1.0], dtype=torch.float32, device=self.device)
+            loss = loss_fn(farthest_vector.unsqueeze(0), centroid.unsqueeze(0), target)
+            loss.backward(retain_graph=False)
+            optimizer.step()
+            farthest_vector.data = torch.clamp(farthest_vector.data, -0.3, 0.3)
+        return farthest_vector.detach().cpu().numpy()
+
+
+    def _optimize_query(self, target_embedding):
+        """
+        Perform Greedy Cosine Quantization (GCQ) attack to perturb a suffix and create adversarial embeddings.
+
+        Returns:
+            tuple: Best suffix, best loss, and best embedding found during the attack.
+            """
+        # start optimizing
+        best_suffix = self.info_prompt
+        best_loss = float('inf')
+        best_embedding = None
+        for iteration in range(self.iterations):
+            indices = list(range(len(self.control_toks)))
+            random.shuffle(indices)
+            for i in indices:
+                current_best_toks = self.tokenizer.encode(best_suffix, add_special_tokens=False, return_tensors='pt')[0].to(
+                    self.device)
+                candidate_tokens = random.sample(self.all_tokens, self.pool_size)
+                candidate_texts = []
+                for token in candidate_tokens:
+                    new_control_toks = current_best_toks.clone()
+                    new_control_toks[i] = token
+                    new_control_text = self.tokenizer.decode(new_control_toks)
+                    candidate_texts.append(new_control_text)
+                sentences = [
+                    self.command_prompt.replace("<info>", text)
+                    for text in candidate_texts
+                ]
+                embeddings = self.embedding_model._embed_batch(sentences)
+                embedding_tensor = torch.tensor(embeddings, device=self.device)
+                target_tensor = torch.tensor(target_embedding, device=self.device)
+                losses = 1 - torch.nn.functional.cosine_similarity(
+                    embedding_tensor, target_tensor.unsqueeze(0), dim=1
+                )
+                candidate_index = int(torch.argmin(losses).item())
+                candidate_loss = float(losses[candidate_index].item())
+                if candidate_loss < best_loss:
+                    best_loss = candidate_loss
+                    best_suffix = candidate_texts[candidate_index]
+                    best_embedding = embeddings[candidate_index]
+            logging.info(f"Iteration {iteration + 1}/{self.iterations}, Loss: {best_loss}")
+        return best_suffix, best_loss, best_embedding
+
+
+    def __calculate_loss(self, opt_emb, target_emb, device):
+        """
+        Calculate cosine similarity loss between two embeddings.
+
+        Returns:
+            float: Cosine similarity loss.
+        """
+        cosine_similarity = nn.CosineSimilarity(dim=1)
+        sentence_embedding = torch.tensor(opt_emb).to(device)
+        target_embedding = torch.tensor(target_emb).to(device)
+        if sentence_embedding.dim() == 1:
+            sentence_embedding = sentence_embedding.unsqueeze(0)
+        if target_embedding.dim() == 1:
+            target_embedding = target_embedding.unsqueeze(0)
+        loss = 1 - cosine_similarity(sentence_embedding, target_embedding).mean().item()
+        return loss
+
+
+    def parse_response(self, response):
+        """
+        Parse the response from RAG system (generator) to extract information.
+        """
+        results = parse_repeat_response(response)
+
+        if results == []:
+            if detect_refusal(response) == 1:
+                results = [response]
+                
+        self._embed_unique_contents(results)
+        return results
+        
+        
+    def _embed_unique_contents(self, contents):
+        """
+        Embed and store unique contents in the embedding space.
+        """
+        for content in contents:
+            content_embedding = self.embedding_model._embed(content)
+            is_unique = all(np.linalg.norm(np.array(content_embedding) - np.array(vec)) > 1e-6 for vec in self.embedding_space)
+            if is_unique:
+                self.embedding_space.append(content_embedding)
