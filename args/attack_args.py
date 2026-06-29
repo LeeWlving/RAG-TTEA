@@ -141,6 +141,20 @@ def get_attack_args(p, attack):
             "--ak_saturation_visits", dest="ak.saturation_visits", default=5, type=int, help="Recent zero-reward visits before TTEA marks a node saturated")
         p.add_argument(
             "--ak_novelty_threshold", dest="ak.novelty_threshold", default=0.92, type=float, help="Max similarity below which a parsed chunk is new in TTEA memory")
+        p.add_argument(
+            "--ak_lenses", dest="ak.lenses", default="entity,attribute,relation,timeline,rare_case,example,edge_case", type=str, help="Comma-separated sub-intent lenses used as per-node TTEA bandit arms")
+        p.add_argument(
+            "--ak_lens_ucb_c", dest="ak.lens_ucb_c", default=0.8, type=float, help="UCB exploration weight for per-node TTEA lens selection")
+        p.add_argument(
+            "--ak_lens_repeat_mu", dest="ak.lens_repeat_mu", default=0.35, type=float, help="Penalty weight for same node+lens repeated top-k retrievals in TTEA lens selection")
+        p.add_argument(
+            "--ak_node_repeat_mu", dest="ak.node_repeat_mu", default=0.25, type=float, help="Penalty weight for same-node repeated top-k retrievals in TTEA lens selection and reward")
+        p.add_argument(
+            "--ak_global_repeat_mu", dest="ak.global_repeat_mu", default=0.15, type=float, help="Penalty weight for globally repeated top-k retrievals in TTEA lens selection and reward")
+        p.add_argument(
+            "--ak_lens_repeat_doc_sim_threshold", dest="ak.lens_repeat_doc_sim_threshold", default=0.92, type=float, help="Embedding similarity threshold for fallback repeated-doc detection per TTEA overlap history")
+        p.add_argument(
+            "--ak_lens_repeat_history_limit", dest="ak.lens_repeat_history_limit", default=1000, type=int, help="Maximum per-lens retrieved document embeddings cached for repeat estimation")
     elif attack == "RandomText":
         p.add_argument(
             "--ak_llm_model", dest="ak.llm_model", default="gpt4o-mini", type=str, help="LLM model for RandomText attack")
