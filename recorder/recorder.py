@@ -10,12 +10,41 @@ class Recorder:
         
         self.acm_rag_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.acm_attack_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.session_rag_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.session_attack_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        if args.continue_pipe and os.path.exists(self.log_path):
+            self._restore_progress()
+
+    def _restore_progress(self):
+        decoder = json.JSONDecoder()
+        with open(self.log_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+
+        position = 0
+        records = []
+        while position < len(content):
+            while position < len(content) and content[position].isspace():
+                position += 1
+            if position >= len(content):
+                break
+            record, position = decoder.raw_decode(content, position)
+            records.append(record)
+
+        if not records:
+            return
+
+        self.start_query = max(record["query_id"] for record in records) + 1
+        for record in records:
+            for key in self.acm_rag_cost:
+                self.acm_rag_cost[key] += record.get("rag_step_cost", {}).get(key, 0)
+                self.acm_attack_cost[key] += record.get("attack_step_cost", {}).get(key, 0)
+        logging.info("Restored %d completed queries from %s", len(records), self.log_path)
         
 
     def recording(self, query_id, query, response, retrieved_docs, extracted_info, args, rag, attack, times):
         rag_step_cost, attack_step_cost = self.calculate_cost(args, rag, attack)
         # Save the recording information to log file
-        with open(self.log_path, "a") as f:
+        with open(self.log_path, "a", encoding="utf-8") as f:
             record = {
                 "query_id": query_id,
                 "query": query,
@@ -74,11 +103,13 @@ class Recorder:
         rag_cost["completion_tokens"] += cost["completion_tokens"]
         rag_cost["total_tokens"] += cost["prompt_tokens"] + cost["completion_tokens"]
         
-        step_rag_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        step_rag_cost['prompt_tokens'] = rag_cost['prompt_tokens'] - self.acm_rag_cost['prompt_tokens']
-        step_rag_cost['completion_tokens'] = rag_cost['completion_tokens'] - self.acm_rag_cost['completion_tokens']
-        step_rag_cost['total_tokens'] = rag_cost['total_tokens'] - self.acm_rag_cost['total_tokens']
-        self.acm_rag_cost = rag_cost
+        step_rag_cost = {
+            key: rag_cost[key] - self.session_rag_cost[key]
+            for key in rag_cost
+        }
+        self.session_rag_cost = rag_cost
+        for key in self.acm_rag_cost:
+            self.acm_rag_cost[key] += step_rag_cost[key]
         
         
         attack_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -87,10 +118,12 @@ class Recorder:
             attack_cost["prompt_tokens"] += cost["prompt_tokens"]
             attack_cost["completion_tokens"] += cost["completion_tokens"]
             attack_cost["total_tokens"] += cost["prompt_tokens"] + cost["completion_tokens"]
-        step_attack_cost = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        step_attack_cost['prompt_tokens'] = attack_cost['prompt_tokens'] - self.acm_attack_cost['prompt_tokens']
-        step_attack_cost['completion_tokens'] = attack_cost['completion_tokens'] - self.acm_attack_cost['completion_tokens']
-        step_attack_cost['total_tokens'] = attack_cost['total_tokens'] - self.acm_attack_cost['total_tokens']
-        self.acm_attack_cost = attack_cost
+        step_attack_cost = {
+            key: attack_cost[key] - self.session_attack_cost[key]
+            for key in attack_cost
+        }
+        self.session_attack_cost = attack_cost
+        for key in self.acm_attack_cost:
+            self.acm_attack_cost[key] += step_attack_cost[key]
             
         return step_rag_cost, step_attack_cost

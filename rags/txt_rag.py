@@ -2,8 +2,8 @@ import os
 import logging
 
 from langchain_community.vectorstores import Chroma
-from langchain.docstore.document import Document
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
 import openai
 from tqdm import tqdm
 import torch
@@ -22,9 +22,9 @@ class TextRAG(RAGSystem):
         super().__init__(args)
         
         prompt_dir = os.environ.get("PROMPT_PATH")
-        with open(os.path.join(prompt_dir, self.gen_kwargs.template), "r") as f:
+        with open(os.path.join(prompt_dir, self.gen_kwargs.template), "r", encoding="utf-8") as f:
             self.gen_kwargs.template = f.read()
-        with open(os.path.join(prompt_dir, self.gen_kwargs.system_prompt), "r") as f:
+        with open(os.path.join(prompt_dir, self.gen_kwargs.system_prompt), "r", encoding="utf-8") as f:
             self.gen_kwargs.system_prompt = f.read()
         self.system_prompt = self.gen_kwargs.system_prompt.replace("{role}", args.role)
 
@@ -53,7 +53,7 @@ class TextRAG(RAGSystem):
                 embedding_function=self.retriever,
                 collection_name="v_db"
             )
-            current_count = len(db.get()["ids"])
+            current_count = db._collection.count()
             if current_count == expected_count:
                 logging.info(f"✅ Database already exists, document count matches ({current_count}).")
             else:

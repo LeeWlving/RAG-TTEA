@@ -9,7 +9,7 @@ from urllib import response
 import torch
 import torch.nn as nn
 import numpy as np
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 import pandas as pd
 
 from .base import KnowExAttack
@@ -64,11 +64,11 @@ class CopyBreak(KnowExAttack):
         
         
         prompt_dir = os.environ.get("PROMPT_PATH")
-        with open(os.path.join(prompt_dir, self.attack_template), "r") as f:
+        with open(os.path.join(prompt_dir, self.attack_template), "r", encoding="utf-8") as f:
             self.attack_template = f.read()
-        with open(os.path.join(prompt_dir, self.explore_template), "r") as f:
+        with open(os.path.join(prompt_dir, self.explore_template), "r", encoding="utf-8") as f:
             self.explore_template = f.read()
-        with open(os.path.join(prompt_dir, self.exploit_template), "r") as f:
+        with open(os.path.join(prompt_dir, self.exploit_template), "r", encoding="utf-8") as f:
             self.exploit_template = f.read()
 
 

@@ -9,7 +9,7 @@ import sys
 import torch
 import torch.nn as nn
 import numpy as np
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 import pandas as pd
 
 from .base import KnowExAttack

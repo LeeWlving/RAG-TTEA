@@ -77,7 +77,10 @@ def pipeline(args):
         # inject the query into rag system to get response
         response, retrieved_docs = rag.get_response(query)
         t2 = time.perf_counter()
-        
+
+        if hasattr(attack, "observe_retrieved_docs"):
+            attack.observe_retrieved_docs(retrieved_docs)
+
         # parse response into extracted information
         extracted_info = attack.parse_response(response)
         t3 = time.perf_counter()
@@ -109,4 +112,5 @@ if __name__ == "__main__":
         pipeline(p)
     except Exception as e:
         logging.error(e, exc_info=True)
+
 

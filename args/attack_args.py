@@ -1,4 +1,4 @@
-
+﻿
 
 
 def get_attack_args(p, attack):
@@ -52,6 +52,8 @@ def get_attack_args(p, attack):
         p.add_argument(
             "--ak_attack_emb_model", dest="ak.attack_emb_model", default="MiniLM", type=str, help="Embedding model for IKEA attack")
         p.add_argument(
+            "--ak_device", dest="ak.device", default="cpu", type=str, help="Device for IKEA embedding model")
+        p.add_argument(
             "--ak_topic_word", dest="ak.topic_word", default="enron emails", type=str, help="Topic word for IKEA attack")
         p.add_argument(
             "--ak_num_anchors", dest="ak.num_anchors", default=5, type=int, help="Number of anchor points for IKEA attack")
@@ -88,6 +90,63 @@ def get_attack_args(p, attack):
         p.add_argument(
             "--ak_thresh_stop_y", dest="ak.thresh_stop_y", default=0.9, type=float, help="Threshold to stop query generation for IKEA attack")
 
+    elif attack == "TTEA":
+        p.add_argument(
+            "--ak_attack_llm", dest="ak.attack_llm", default="gpt4o-mini", type=str, help="LLM model for TTEA attack-side generation")
+        p.add_argument(
+            "--ak_shadow_llm", dest="ak.shadow_llm", default="gpt4o-mini", type=str, help="Shadow LLM used to estimate semantic shift for TTEA")
+        p.add_argument(
+            "--ak_attack_emb_model", dest="ak.attack_emb_model", default="MiniLM", type=str, help="Embedding model for TTEA")
+        p.add_argument(
+            "--ak_attack_template", dest="ak.attack_template", default="ttea/attack_template.txt", type=str, help="Attack instruction template path for TTEA")
+        p.add_argument(
+            "--ak_device", dest="ak.device", default="cpu", type=str, help="Device for TTEA embedding model")
+        p.add_argument(
+            "--ak_topic_word", dest="ak.topic_word", default="public knowledge", type=str, help="Topic prior used to label the root taxonomy node")
+        p.add_argument(
+            "--ak_taxonomy_path", dest="ak.taxonomy_path", default=None, type=str, help="Optional JSON taxonomy path for TTEA")
+        p.add_argument(
+            "--ak_taxonomy_builder", dest="ak.taxonomy_builder", default="static", choices=["static", "llm"], type=str, help="Taxonomy builder for TTEA: static built-in tree or LLM-generated public taxonomy")
+        p.add_argument(
+            "--ak_taxonomy_preset", dest="ak.taxonomy_preset", default="auto", choices=["auto", "general", "medicine", "pokemon", "academic", "business", "literature"], type=str, help="Static taxonomy preset used when TTEA taxonomy_builder is static or LLM fallback is needed")
+        p.add_argument(
+            "--ak_llm_taxonomy_children", dest="ak.llm_taxonomy_children", default=5, type=int, help="Number of child categories requested from the LLM per TTEA taxonomy expansion")
+        p.add_argument(
+            "--ak_max_depth", dest="ak.max_depth", default=3, type=int, help="Maximum taxonomy depth loaded by TTEA")
+        p.add_argument(
+            "--ak_max_children", dest="ak.max_children", default=8, type=int, help="Maximum children per taxonomy node loaded by TTEA")
+        p.add_argument(
+            "--ak_max_anchors", dest="ak.max_anchors", default=12, type=int, help="Maximum anchors cached per mature TTEA leaf")
+        p.add_argument(
+            "--ak_temperature", dest="ak.temperature", default=0.4, type=float, help="Reserved generation temperature for TTEA")
+        p.add_argument(
+            "--ak_ucb_c", dest="ak.ucb_c", default=0.8, type=float, help="UCB exploration weight for TTEA scheduler")
+        p.add_argument(
+            "--ak_lambda_prior", dest="ak.lambda_prior", default=0.5, type=float, help="Posterior prior weight for TTEA scheduler")
+        p.add_argument(
+            "--ak_gamma_entropy", dest="ak.gamma_entropy", default=0.2, type=float, help="Sibling entropy weight for TTEA scheduler")
+        p.add_argument(
+            "--ak_eta_shift", dest="ak.eta_shift", default=2.0, type=float, help="Semantic shift weight for TTEA posterior update")
+        p.add_argument(
+            "--ak_rho_reward", dest="ak.rho_reward", default=1.0, type=float, help="Novelty reward weight for TTEA posterior update")
+        p.add_argument(
+            "--ak_shift_threshold", dest="ak.shift_threshold", default=0.18, type=float, help="Average semantic-shift threshold for TTEA expansion/maturity")
+        p.add_argument(
+            "--ak_prune_threshold", dest="ak.prune_threshold", default=0.04, type=float, help="Low semantic-shift threshold for pruning TTEA nodes")
+        p.add_argument(
+            "--ak_mature_shift_epsilon", dest="ak.mature_shift_epsilon", default=0.04, type=float, help="Semantic-shift stability window for mature leaves")
+        p.add_argument(
+            "--ak_min_mature_visits", dest="ak.min_mature_visits", default=2, type=int, help="Minimum visits before TTEA can prune or mature a node")
+        p.add_argument(
+            "--ak_saturation_visits", dest="ak.saturation_visits", default=5, type=int, help="Recent zero-reward visits before TTEA marks a node saturated")
+        p.add_argument(
+            "--ak_novelty_threshold", dest="ak.novelty_threshold", default=0.92, type=float, help="Max similarity below which a parsed chunk is new in TTEA memory")
+        p.add_argument(
+            "--ak_repeat_penalty_mu", dest="ak.repeat_penalty_mu", default=0.35, type=float, help="Penalty weight for repeated top-k retrieval results in TTEA")
+        p.add_argument(
+            "--ak_repeat_doc_sim_threshold", dest="ak.repeat_doc_sim_threshold", default=0.92, type=float, help="Embedding similarity threshold for fallback repeated-doc detection in TTEA")
+        p.add_argument(
+            "--ak_repeat_history_limit", dest="ak.repeat_history_limit", default=1000, type=int, help="Maximum per-node retrieved document embeddings cached for TTEA repeat penalty")
     elif attack == "RandomText":
         p.add_argument(
             "--ak_llm_model", dest="ak.llm_model", default="gpt4o-mini", type=str, help="LLM model for RandomText attack")
@@ -134,3 +193,4 @@ def get_attack_args(p, attack):
         
 
     return p
+

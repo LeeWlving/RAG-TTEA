@@ -10,7 +10,7 @@ from urllib import response
 import torch
 import torch.nn as nn
 import numpy as np
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 import pandas as pd
 import json
 import re
@@ -40,7 +40,7 @@ class IKEA(KnowExAttack):
 
         # Overall
         self.attack_llm = get_llm(args.attack_llm)
-        self.attack_emb = get_embedding(args.attack_emb_model)
+        self.attack_emb = get_embedding(args.attack_emb_model, device=args.device)
         
         ## Anchor concepts
         self.topic_word = args.topic_word  # topic word to guide anchor concept generation (prior)
@@ -85,11 +85,11 @@ class IKEA(KnowExAttack):
 
         # load templates
         prompt_dir = os.environ.get("PROMPT_PATH")
-        with open(os.path.join(prompt_dir, self.anchor_gen_template), 'r') as f:
+        with open(os.path.join(prompt_dir, self.anchor_gen_template), 'r', encoding="utf-8") as f:
             self.anchor_gen_template = f.read()
-        with open(os.path.join(prompt_dir, self.anchor_query_gen_template), 'r') as f:
+        with open(os.path.join(prompt_dir, self.anchor_query_gen_template), 'r', encoding="utf-8") as f:
             self.anchor_query_gen_template = f.read()
-        with open(os.path.join(prompt_dir, self.anchor_mutate_gen_template), 'r') as f:
+        with open(os.path.join(prompt_dir, self.anchor_mutate_gen_template), 'r', encoding="utf-8") as f:
             self.anchor_mutate_gen_template = f.read()
         
         self.selected = []

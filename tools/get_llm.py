@@ -2,6 +2,24 @@ import os, yaml
 
 
 def get_llm(model_name):
+    if model_name == "deepseek-chat":
+        from ._llm_engines import OpenAIEngine
+        return OpenAIEngine(
+            model_name="deepseek-chat",
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com",
+        )
+    if model_name == "qwen-plus":
+        from ._llm_engines import OpenAIEngine
+        return OpenAIEngine(
+            model_name="qwen-plus",
+            api_key=os.environ.get("DASHSCOPE_API_KEY"),
+            base_url=os.environ.get(
+                "DASHSCOPE_BASE_URL",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+        )
+
     # load model configs from yaml
     with open(os.environ["KEYS_PATH"], "r") as f:
         keys_cfg = yaml.safe_load(f)['llm']
@@ -25,6 +43,12 @@ def get_llm(model_name):
         model_kwargs = keys_cfg['openai']['gpt4o-mini']
         llm = OpenAIEngine(model_name=model_kwargs['model_name'],
                            api_key=model_kwargs['api_key'])
+    elif model_name in keys_cfg.get('deepseek', {}):
+        from ._llm_engines import OpenAIEngine
+        model_kwargs = keys_cfg['deepseek'][model_name]
+        llm = OpenAIEngine(model_name=model_kwargs.get('model_name', model_name),
+                           api_key=model_kwargs['api_key'],
+                           base_url=model_kwargs.get('base_url', 'https://api.deepseek.com'))
         
     elif model_name == "claude-4.5-sonnet":
         from ._llm_engines import AnthropicVertexEngine

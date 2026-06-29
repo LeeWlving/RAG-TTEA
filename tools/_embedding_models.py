@@ -19,12 +19,25 @@ class MiniLMEmbeddings:
         return self._embed(text)
 
     def _embed(self, text):
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, padding=True)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        model_output = self.model(**inputs)
-        sentence_embeddings = self._mean_pooling(model_output, inputs['attention_mask'])
-        sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
-        return sentence_embeddings.cpu().detach().numpy().flatten().tolist()
+        return self._embed_batch([text])[0]
+
+    def _embed_batch(self, texts, batch_size=64):
+        embeddings = []
+        self.model.eval()
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start:start + batch_size]
+            inputs = self.tokenizer(
+                batch, return_tensors="pt", truncation=True, padding=True
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                model_output = self.model(**inputs)
+                sentence_embeddings = self._mean_pooling(
+                    model_output, inputs["attention_mask"]
+                )
+                sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
+            embeddings.extend(sentence_embeddings.cpu().numpy().tolist())
+        return embeddings
 
     def _mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output[0]  # First element of model_output contains all token embeddings

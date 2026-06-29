@@ -13,10 +13,11 @@ openai_role_conversions = {MessageRole.TOOL_RESPONSE: MessageRole.USER}
 
 
 class OpenAIEngine:
-    def __init__(self, model_name="gpt-4o", api_key=None):
+    def __init__(self, model_name="gpt-4o", api_key=None, base_url=None):
         self.model_name = model_name
         self.client = OpenAI(
             api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            base_url=base_url,
         )
         
         self.metrics = {
@@ -29,14 +30,28 @@ class OpenAIEngine:
     def __call__(self, messages, stop_sequences=[], temperature=0.5, *args, **kwargs):
         messages = get_clean_message_list(messages, role_conversions=openai_role_conversions)
 
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            stop=stop_sequences,
-            temperature=temperature,
-            *args,
-            **kwargs,
+        response = None
+        retryable_errors = (
+            openai.APIConnectionError,
+            openai.APIStatusError,
+            openai.AuthenticationError,
+            openai.RateLimitError,
         )
+        for attempt in range(5):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    stop=stop_sequences,
+                    temperature=temperature,
+                    *args,
+                    **kwargs,
+                )
+                break
+            except retryable_errors:
+                if attempt == 4:
+                    raise
+                sleep(2 ** attempt)
         
         self.metrics["num_calls"] += 1
         self.metrics["prompt_tokens"] += response.usage.prompt_tokens

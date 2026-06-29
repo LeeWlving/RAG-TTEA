@@ -7,7 +7,7 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 import pandas as pd
 
 from tools.parse_response import parse_repeat_response
@@ -54,14 +54,17 @@ class DGEA(KnowExAttack):
         logging.info(f"Total tokens in tokenizer: {len(self.all_tokens)}")
         
         prompt_dir = os.environ.get("PROMPT_PATH")
-        with open(os.path.join(prompt_dir, self.command_prompt), 'r') as f:
+        with open(os.path.join(prompt_dir, self.command_prompt), 'r', encoding="utf-8") as f:
             self.command_prompt = f.read()
-        with open(os.path.join(prompt_dir, self.info_prompt), 'r') as f:
+        with open(os.path.join(prompt_dir, self.info_prompt), 'r', encoding="utf-8") as f:
             self.info_prompt = f.read()
         
         extra_dir = os.environ.get("EXTRA_PATH")
-        args.random_vec = args.random_vec.split(".")[0] + f"_wiki_{args.emb_model}.csv"
-        vec_df = pd.read_csv(os.path.join(extra_dir, args.random_vec))
+        model_stats = args.random_vec.split(".")[0] + f"_wiki_{args.emb_model}.csv"
+        stats_path = os.path.join(extra_dir, model_stats)
+        if not os.path.exists(stats_path):
+            stats_path = os.path.join(extra_dir, args.random_vec)
+        vec_df = pd.read_csv(stats_path)
         self.random_vec = self._get_distribution_of_embeddings(vec_df['mean'].values, vec_df['variance'].values, vectors_num=args.max_query)
         
 
@@ -116,9 +119,13 @@ class DGEA(KnowExAttack):
             Returns:
                 np.array: A vector that is dissimilar to the centroid of the embedding space.
         """
-        embedding_space_tensor = torch.tensor(self.embedding_space, dtype=torch.float32).reshape(-1, self.embedding_dim)
+        embedding_space_tensor = torch.tensor(
+            self.embedding_space, dtype=torch.float32, device=self.device
+        ).reshape(-1, self.embedding_dim)
         centroid = torch.mean(embedding_space_tensor, dim=0)
-        farthest_vector = torch.randn(self.embedding_dim, requires_grad=True)
+        farthest_vector = torch.randn(
+            self.embedding_dim, device=self.device, requires_grad=True
+        )
         farthest_vector = 0.6 * (farthest_vector - torch.min(farthest_vector)) / (
                 torch.max(farthest_vector) - torch.min(farthest_vector)) - 0.3
         farthest_vector = farthest_vector.clone().detach().requires_grad_(True)
@@ -126,12 +133,12 @@ class DGEA(KnowExAttack):
         loss_fn = torch.nn.CosineEmbeddingLoss()
         for _ in range(30000):
             optimizer.zero_grad()
-            target = torch.tensor([-1.0], dtype=torch.float32)
+            target = torch.tensor([-1.0], dtype=torch.float32, device=self.device)
             loss = loss_fn(farthest_vector.unsqueeze(0), centroid.unsqueeze(0), target)
             loss.backward(retain_graph=False)
             optimizer.step()
             farthest_vector.data = torch.clamp(farthest_vector.data, -0.3, 0.3)
-        return farthest_vector.detach().numpy()
+        return farthest_vector.detach().cpu().numpy()
 
 
     def _optimize_query(self, target_embedding):
@@ -152,19 +159,28 @@ class DGEA(KnowExAttack):
                 current_best_toks = self.tokenizer.encode(best_suffix, add_special_tokens=False, return_tensors='pt')[0].to(
                     self.device)
                 candidate_tokens = random.sample(self.all_tokens, self.pool_size)
+                candidate_texts = []
                 for token in candidate_tokens:
                     new_control_toks = current_best_toks.clone()
                     new_control_toks[i] = token
                     new_control_text = self.tokenizer.decode(new_control_toks)
-                    perturbed_sentence = self.command_prompt.replace("<info>", new_control_text)
-                    sentence_embedding = self.embed_sentence(perturbed_sentence)
-                    loss = self.__calculate_loss(sentence_embedding, target_embedding, self.device)
-                    if loss < best_loss:
-                        best_loss = loss
-                        best_suffix = new_control_text
-                        best_embedding = sentence_embedding
-                        """if best_loss < 0.3: # add a Threshold 
-                            return best_suffix, best_loss, best_embedding"""
+                    candidate_texts.append(new_control_text)
+                sentences = [
+                    self.command_prompt.replace("<info>", text)
+                    for text in candidate_texts
+                ]
+                embeddings = self.embedding_model._embed_batch(sentences)
+                embedding_tensor = torch.tensor(embeddings, device=self.device)
+                target_tensor = torch.tensor(target_embedding, device=self.device)
+                losses = 1 - torch.nn.functional.cosine_similarity(
+                    embedding_tensor, target_tensor.unsqueeze(0), dim=1
+                )
+                candidate_index = int(torch.argmin(losses).item())
+                candidate_loss = float(losses[candidate_index].item())
+                if candidate_loss < best_loss:
+                    best_loss = candidate_loss
+                    best_suffix = candidate_texts[candidate_index]
+                    best_embedding = embeddings[candidate_index]
             logging.info(f"Iteration {iteration + 1}/{self.iterations}, Loss: {best_loss}")
         return best_suffix, best_loss, best_embedding
 
