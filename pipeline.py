@@ -78,6 +78,9 @@ def pipeline(args):
         response, retrieved_docs = rag.get_response(query)
         t2 = time.perf_counter()
         
+        if hasattr(attack, "observe_retrieved_docs"):
+            attack.observe_retrieved_docs(retrieved_docs)
+        
         # parse response into extracted information
         extracted_info = attack.parse_response(response)
         t3 = time.perf_counter()

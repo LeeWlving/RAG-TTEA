@@ -141,6 +141,28 @@ def get_attack_args(p, attack):
             "--ak_saturation_visits", dest="ak.saturation_visits", default=5, type=int, help="Recent zero-reward visits before TTEA marks a node saturated")
         p.add_argument(
             "--ak_novelty_threshold", dest="ak.novelty_threshold", default=0.92, type=float, help="Max similarity below which a parsed chunk is new in TTEA memory")
+        p.add_argument(
+            "--ak_expand_min_visits", dest="ak.expand_min_visits", default=3, type=int, help="Minimum visits before TTEA can force-expand a non-leaf node")
+        p.add_argument(
+            "--ak_expand_reward_window", dest="ak.expand_reward_window", default=3, type=int, help="Recent reward window used by TTEA early expansion")
+        p.add_argument(
+            "--ak_expand_reward_epsilon", dest="ak.expand_reward_epsilon", default=0.0, type=float, help="Recent reward mean threshold for TTEA early expansion")
+        p.add_argument(
+            "--ak_expand_repeat_threshold", dest="ak.expand_repeat_threshold", default=0.67, type=float, help="Node-level repeated top-k threshold for TTEA early expansion")
+        p.add_argument(
+            "--ak_expand_entropy_threshold", dest="ak.expand_entropy_threshold", default=0.75, type=float, help="Sibling entropy threshold for low-reward TTEA early expansion")
+        p.add_argument(
+            "--ak_expand_retire_parent", dest="ak.expand_retire_parent", default=True, action="store_true", help="Retire a forced-expanded parent so scheduler drills into active children")
+        p.add_argument(
+            "--ak_expand_keep_parent", dest="ak.expand_retire_parent", action="store_false", help="Keep forced-expanded parents schedulable")
+        p.add_argument(
+            "--ak_expand_generate_leaf_children", dest="ak.expand_generate_leaf_children", default=True, action="store_true", help="Generate child nodes for triggered static leaves before max_depth")
+        p.add_argument(
+            "--ak_no_expand_generate_leaf_children", dest="ak.expand_generate_leaf_children", action="store_false", help="Disable dynamic child generation for triggered static leaves")
+        p.add_argument(
+            "--ak_expand_anchor_fallback", dest="ak.expand_anchor_fallback", default=True, action="store_true", help="Use extracted anchors as child nodes when dynamic taxonomy split returns no children")
+        p.add_argument(
+            "--ak_no_expand_anchor_fallback", dest="ak.expand_anchor_fallback", action="store_false", help="Disable anchor-based child fallback for early expansion")
     elif attack == "RandomText":
         p.add_argument(
             "--ak_llm_model", dest="ak.llm_model", default="gpt4o-mini", type=str, help="LLM model for RandomText attack")

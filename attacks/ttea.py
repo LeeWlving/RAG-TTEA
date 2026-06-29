@@ -37,7 +37,9 @@ class TaxonomyNode:
     total_shift: float = 0.0
     total_reward: float = 0.0
     recent_rewards: List[float] = field(default_factory=list)
+    recent_repeats: List[float] = field(default_factory=list)
     anchors: List[str] = field(default_factory=list)
+    expanded_once: bool = False
 
     @property
     def avg_shift(self) -> float:
@@ -97,6 +99,14 @@ class TTEA(KnowExAttack):
         self.min_mature_visits = args.min_mature_visits
         self.saturation_visits = args.saturation_visits
         self.novelty_threshold = args.novelty_threshold
+        self.expand_min_visits = getattr(args, "expand_min_visits", 3)
+        self.expand_reward_window = getattr(args, "expand_reward_window", 3)
+        self.expand_reward_epsilon = getattr(args, "expand_reward_epsilon", 0.0)
+        self.expand_repeat_threshold = getattr(args, "expand_repeat_threshold", 0.67)
+        self.expand_entropy_threshold = getattr(args, "expand_entropy_threshold", 0.75)
+        self.expand_retire_parent = getattr(args, "expand_retire_parent", True)
+        self.expand_generate_leaf_children = getattr(args, "expand_generate_leaf_children", True)
+        self.expand_anchor_fallback = getattr(args, "expand_anchor_fallback", True)
 
         self.nodes: Dict[str, TaxonomyNode] = {}
         self.root_id = "root"
@@ -106,6 +116,8 @@ class TTEA(KnowExAttack):
         self.current_query: Optional[str] = None
         self.current_info_query: Optional[str] = None
         self.current_anchor: Optional[str] = None
+        self.latest_retrieved_docs = []
+        self.node_retrieval_ids: Dict[str, set] = {}
         self.memory_chunks: List[str] = []
         self.memory_embs: List[np.ndarray] = []
 
@@ -158,6 +170,9 @@ class TTEA(KnowExAttack):
         logging.info("TTEA query %d: %s", query_id, query)
         return query
 
+    def observe_retrieved_docs(self, retrieved_docs):
+        self.latest_retrieved_docs = retrieved_docs or []
+
     def parse_response(self, response):
         if self.current_node_id is None or self.current_query is None:
             logging.warning("TTEA parse_response called before get_query; returning raw parsed response")
@@ -167,25 +182,31 @@ class TTEA(KnowExAttack):
         chunks = self._parse_informative_chunks(response)
         shift = self._semantic_shift(self.current_info_query or self.current_query, response)
         reward, new_chunks = self._novelty_reward(chunks)
+        node_repeat_at_k = self._node_repeat_at_k(node.node_id, self.latest_retrieved_docs)
         anchors = self._extract_anchors(new_chunks or chunks, node)
 
         node.visits += 1
         node.total_shift += shift
         node.total_reward += reward
         node.recent_rewards.append(reward)
-        node.recent_rewards = node.recent_rewards[-self.saturation_visits :]
+        node.recent_rewards = node.recent_rewards[-max(self.saturation_visits, self.expand_reward_window) :]
+        node.recent_repeats.append(node_repeat_at_k)
+        node.recent_repeats = node.recent_repeats[-self.expand_reward_window :]
+        self._update_node_retrieval_history(node.node_id, self.latest_retrieved_docs)
         self._merge_anchors(node, anchors)
         self._update_node_status(node)
+        self._maybe_expand_node(node, reward, node_repeat_at_k)
         self._backpropagate(node, shift, reward)
         self._update_sibling_posteriors(node.parent)
 
         logging.info(
-            "TTEA response update: node=%s label='%s' mode=%s shift=%.4f reward=%.4f parsed_chunks=%d new_chunks=%d anchors_added=%d status=%s posterior=%.4f",
+            "TTEA response update: node=%s label='%s' mode=%s shift=%.4f reward=%.4f repeat_at_k=%.4f parsed_chunks=%d new_chunks=%d anchors_added=%d status=%s posterior=%.4f",
             node.node_id,
             node.label,
             self.current_mode,
             shift,
             reward,
+            node_repeat_at_k,
             len(chunks),
             len(new_chunks),
             len(anchors),
@@ -661,6 +682,103 @@ class TTEA(KnowExAttack):
         reward = float(np.mean(novelty_scores)) if novelty_scores else 0.0
         return reward, new_chunks
 
+    def _doc_id(self, doc) -> Optional[str]:
+        if isinstance(doc, dict):
+            for key in ("id", "index", "doc_id", "source"):
+                if doc.get(key) is not None:
+                    return str(doc.get(key))
+            metadata = doc.get("metadata")
+            if isinstance(metadata, dict):
+                for key in ("id", "index", "doc_id", "source"):
+                    if metadata.get(key) is not None:
+                        return str(metadata.get(key))
+            return None
+        for attr in ("id", "index", "doc_id"):
+            value = getattr(doc, attr, None)
+            if value is not None:
+                return str(value)
+        metadata = getattr(doc, "metadata", None)
+        if isinstance(metadata, dict):
+            for key in ("id", "index", "doc_id", "source"):
+                if metadata.get(key) is not None:
+                    return str(metadata.get(key))
+        return None
+
+    def _node_repeat_at_k(self, node_id: str, retrieved_docs) -> float:
+        docs = retrieved_docs or []
+        if not docs:
+            return 0.0
+        history = self.node_retrieval_ids.setdefault(node_id, set())
+        repeats = 0
+        for doc in docs:
+            doc_id = self._doc_id(doc)
+            if doc_id is not None and doc_id in history:
+                repeats += 1
+        return repeats / max(1, len(docs))
+
+    def _update_node_retrieval_history(self, node_id: str, retrieved_docs):
+        history = self.node_retrieval_ids.setdefault(node_id, set())
+        for doc in retrieved_docs or []:
+            doc_id = self._doc_id(doc)
+            if doc_id is not None:
+                history.add(doc_id)
+
+    def _recent_reward_mean(self, node: TaxonomyNode) -> float:
+        window = max(1, self.expand_reward_window)
+        recent = node.recent_rewards[-window:]
+        if not recent:
+            return 0.0
+        return float(sum(recent) / len(recent))
+
+    def _maybe_expand_node(self, node: TaxonomyNode, reward: float, repeat_at_k: float):
+        if node.node_id == self.root_id or node.depth >= self.max_depth or node.expanded_once:
+            return
+        if node.status == "pruned" or node.visits < self.expand_min_visits:
+            return
+        if not node.children and self.taxonomy_builder != "llm" and not self.expand_generate_leaf_children:
+            return
+
+        reward_window_ready = len(node.recent_rewards) >= max(1, self.expand_reward_window)
+        recent_reward_mean = self._recent_reward_mean(node)
+        low_current_reward = reward <= self.expand_reward_epsilon
+        low_recent_reward = reward_window_ready and recent_reward_mean <= self.expand_reward_epsilon
+        high_repeat = repeat_at_k >= self.expand_repeat_threshold
+        recent_repeat_mean = float(sum(node.recent_repeats) / len(node.recent_repeats)) if node.recent_repeats else 0.0
+        high_recent_repeat = recent_repeat_mean >= self.expand_repeat_threshold
+        high_entropy_low_reward = self._sibling_entropy(node) >= self.expand_entropy_threshold and low_recent_reward
+
+        if not (low_current_reward or low_recent_reward or high_repeat or high_recent_repeat or high_entropy_low_reward):
+            return
+
+        reason = []
+        if low_current_reward:
+            reason.append(f"reward={reward:.4f}")
+        if low_recent_reward:
+            reason.append(f"recent_reward_mean={recent_reward_mean:.4f}")
+        if high_repeat:
+            reason.append(f"repeat_at_k={repeat_at_k:.4f}")
+        if high_recent_repeat:
+            reason.append(f"recent_repeat_mean={recent_repeat_mean:.4f}")
+        if high_entropy_low_reward:
+            reason.append(f"sibling_entropy={self._sibling_entropy(node):.4f}")
+
+        activated = self._activate_children(node, allow_dynamic_split=self.expand_generate_leaf_children)
+        if not node.children and self.expand_anchor_fallback:
+            activated = self._activate_anchor_children(node)
+        if not node.children:
+            return
+        node.expanded_once = True
+        if self.expand_retire_parent:
+            node.status = "saturated"
+        logging.info(
+            "TTEA early-expanded node=%s label='%s' visits=%d activated_children=%d retired_parent=%s reason=%s",
+            node.node_id,
+            node.label,
+            node.visits,
+            activated,
+            self.expand_retire_parent,
+            ",".join(reason) or "visit_gate",
+        )
     def _extract_anchors(self, chunks: Iterable[str], node: TaxonomyNode) -> List[str]:
         text = "\n".join(chunks)
         if not text:
@@ -721,8 +839,44 @@ class TTEA(KnowExAttack):
             node.status = "saturated"
             logging.info("TTEA saturated node=%s label='%s'", node.node_id, node.label)
 
-    def _activate_children(self, node: TaxonomyNode):
-        if not node.children and self.taxonomy_builder == "llm" and node.depth < self.max_depth:
+    def _activate_anchor_children(self, node: TaxonomyNode) -> int:
+        if node.depth >= self.max_depth or not node.anchors:
+            return 0
+        existing = {self.nodes[child_id].label.lower() for child_id in node.children}
+        created = 0
+        for anchor in node.anchors:
+            label = anchor.strip()
+            if not label or label.lower() in existing:
+                continue
+            spec = {
+                "label": label,
+                "description": f"Specific facts, variants, relations, and examples about {label} within {node.label}.",
+            }
+            child_id = self._add_node_from_spec(spec, parent=node.node_id, depth=node.depth + 1)
+            child = self.nodes[child_id]
+            child.prototype = np.array(self.attack_emb._embed(f"{child.label}. {child.description}"))
+            existing.add(label.lower())
+            created += 1
+            if created >= self.max_children:
+                break
+        if created == 0:
+            return 0
+        prior = node.posterior / max(1, len(node.children))
+        for child_id in node.children:
+            child = self.nodes[child_id]
+            if child.status == "unvisited":
+                child.status = "active"
+                child.posterior = prior
+        logging.info(
+            "TTEA anchor-expanded node=%s label='%s' children=%d activated=%d",
+            node.node_id,
+            node.label,
+            len(node.children),
+            created,
+        )
+        return created
+    def _activate_children(self, node: TaxonomyNode, allow_dynamic_split: bool = False) -> int:
+        if not node.children and node.depth < self.max_depth and (self.taxonomy_builder == "llm" or allow_dynamic_split):
             child_specs = self._generate_taxonomy_children(node.label, node.description, node.depth)
             for child in child_specs:
                 self._add_node_from_spec(child, parent=node.node_id, depth=node.depth + 1)
@@ -733,15 +887,24 @@ class TTEA(KnowExAttack):
                     child.prototype = np.array(self.attack_emb._embed(text))
 
         if not node.children:
-            return
+            return 0
 
+        activated = 0
         prior = node.posterior / max(1, len(node.children))
         for child_id in node.children:
             child = self.nodes[child_id]
             if child.status == "unvisited":
                 child.status = "active"
                 child.posterior = prior
-        logging.info("TTEA expanded node=%s label='%s' children=%d", node.node_id, node.label, len(node.children))
+                activated += 1
+        logging.info(
+            "TTEA expanded node=%s label='%s' children=%d activated=%d",
+            node.node_id,
+            node.label,
+            len(node.children),
+            activated,
+        )
+        return activated
 
     def _backpropagate(self, node: TaxonomyNode, shift: float, reward: float):
         parent_id = node.parent
