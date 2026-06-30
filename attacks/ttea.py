@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from .base import KnowExAttack
+from .anchor_utils import extract_anchors_from_texts, normalize_anchor, resolve_anchor_domain
 from tools.attacks import cos_sim
 from tools.get_embedding import get_embedding
 from tools.get_llm import get_llm
@@ -39,6 +40,7 @@ class TaxonomyNode:
     recent_rewards: List[float] = field(default_factory=list)
     recent_repeats: List[float] = field(default_factory=list)
     anchors: List[str] = field(default_factory=list)
+    frontier_anchors: List[str] = field(default_factory=list)
     expanded_once: bool = False
 
     @property
@@ -107,6 +109,10 @@ class TTEA(KnowExAttack):
         self.expand_retire_parent = getattr(args, "expand_retire_parent", True)
         self.expand_generate_leaf_children = getattr(args, "expand_generate_leaf_children", True)
         self.expand_anchor_fallback = getattr(args, "expand_anchor_fallback", True)
+        self.use_frontier_anchors = getattr(args, "use_frontier_anchors", True)
+        self.frontier_anchors_per_round = getattr(args, "frontier_anchors_per_round", 4)
+        self.frontier_anchor_boost = getattr(args, "frontier_anchor_boost", 0.35)
+        self.normalize_exploit_anchors = getattr(args, "normalize_exploit_anchors", True)
 
         self.nodes: Dict[str, TaxonomyNode] = {}
         self.root_id = "root"
@@ -116,8 +122,10 @@ class TTEA(KnowExAttack):
         self.current_query: Optional[str] = None
         self.current_info_query: Optional[str] = None
         self.current_anchor: Optional[str] = None
+        self.current_frontier_anchor: Optional[str] = None
         self.latest_retrieved_docs = []
         self.node_retrieval_ids: Dict[str, set] = {}
+        self.global_retrieval_ids = set()
         self.memory_chunks: List[str] = []
         self.memory_embs: List[np.ndarray] = []
 
@@ -146,15 +154,17 @@ class TTEA(KnowExAttack):
         if mode == "exploit":
             info_query, anchor = self._generate_exploitation_query(node)
             self.current_anchor = anchor
+            self.current_frontier_anchor = None
         else:
-            info_query = self._generate_probe_query(node)
+            info_query, frontier_anchor = self._generate_probe_query(node)
             self.current_anchor = None
+            self.current_frontier_anchor = frontier_anchor
 
         query = self._wrap_attack_query(info_query)
         self.current_info_query = info_query
         self.current_query = query
         logging.info(
-            "TTEA round=%d selected node=%s label='%s' depth=%d status=%s mode=%s posterior=%.4f visits=%d avg_shift=%.4f avg_reward=%.4f anchor=%s",
+            "TTEA round=%d selected node=%s label='%s' depth=%d status=%s mode=%s posterior=%.4f visits=%d avg_shift=%.4f avg_reward=%.4f anchor=%s frontier_anchor=%s frontier_queue=%d",
             query_id,
             node.node_id,
             node.label,
@@ -166,6 +176,8 @@ class TTEA(KnowExAttack):
             node.avg_shift,
             node.avg_reward,
             self.current_anchor or "<none>",
+            self.current_frontier_anchor or "<none>",
+            len(node.frontier_anchors),
         )
         logging.info("TTEA query %d: %s", query_id, query)
         return query
@@ -183,6 +195,8 @@ class TTEA(KnowExAttack):
         shift = self._semantic_shift(self.current_info_query or self.current_query, response)
         reward, new_chunks = self._novelty_reward(chunks)
         node_repeat_at_k = self._node_repeat_at_k(node.node_id, self.latest_retrieved_docs)
+        new_docs = self._new_retrieved_docs(node.node_id, self.latest_retrieved_docs)
+        frontier_anchors = self._extract_frontier_anchors(new_docs, node)
         anchors = self._extract_anchors(new_chunks or chunks, node)
 
         node.visits += 1
@@ -193,14 +207,15 @@ class TTEA(KnowExAttack):
         node.recent_repeats.append(node_repeat_at_k)
         node.recent_repeats = node.recent_repeats[-self.expand_reward_window :]
         self._update_node_retrieval_history(node.node_id, self.latest_retrieved_docs)
-        self._merge_anchors(node, anchors)
+        self._merge_frontier_anchors(node, frontier_anchors)
+        self._merge_anchors(node, list(frontier_anchors) + list(anchors))
         self._update_node_status(node)
         self._maybe_expand_node(node, reward, node_repeat_at_k)
         self._backpropagate(node, shift, reward)
         self._update_sibling_posteriors(node.parent)
 
         logging.info(
-            "TTEA response update: node=%s label='%s' mode=%s shift=%.4f reward=%.4f repeat_at_k=%.4f parsed_chunks=%d new_chunks=%d anchors_added=%d status=%s posterior=%.4f",
+            "TTEA response update: node=%s label='%s' mode=%s shift=%.4f reward=%.4f repeat_at_k=%.4f parsed_chunks=%d new_chunks=%d new_docs=%d frontier_anchors=%d anchors_added=%d status=%s posterior=%.4f",
             node.node_id,
             node.label,
             self.current_mode,
@@ -209,10 +224,14 @@ class TTEA(KnowExAttack):
             node_repeat_at_k,
             len(chunks),
             len(new_chunks),
+            len(new_docs),
+            len(frontier_anchors),
             len(anchors),
             node.status,
             node.posterior,
         )
+        if frontier_anchors:
+            logging.info("TTEA frontier anchors for node=%s: %s", node.node_id, frontier_anchors[:10])
         if anchors:
             logging.info("TTEA anchors for node=%s: %s", node.node_id, anchors[:10])
         logging.info(
@@ -310,12 +329,7 @@ class TTEA(KnowExAttack):
             return []
 
     def _dataset_domain(self) -> str:
-        text = f"{self.dataset_name or ''} {self.topic_word or ''} {self.taxonomy_preset or ''}".lower()
-        if "enron" in text or "email" in text or "business" in text:
-            return "enron"
-        if "health" in text or "medical" in text or "medicine" in text or "care" in text:
-            return "health"
-        return "general"
+        return resolve_anchor_domain(self.dataset_name, self.topic_word, self.taxonomy_preset)
 
     def _expansion_domain_guidance(self) -> str:
         domain = self._dataset_domain()
@@ -334,6 +348,22 @@ class TTEA(KnowExAttack):
                 "- Reject greetings, signatures, stopwords, isolated locations, and generic labels such as Hi, Thanks, Doctor, The, And, Right, Really.\n"
                 "- Do not use raw patient sentence fragments as labels; map them to clinical concepts.\n"
                 "- Good examples: Symptoms and Complaints, Diagnosis and Differential, Medication Side Effects, Procedures and Surgery, Lab Tests and Imaging, Mental Health."
+            )
+        if domain == "pokemon":
+            return (
+                "Dataset-specific guidance for Pokemon data:\n"
+                "- Good child labels are species, moves, types, locations, evolutions, items, abilities, trainers, or story events.\n"
+                "- Reject generic interface words such as First, Items, Generation, Version, Game, Pokemon, Battle, and Type when they appear alone.\n"
+                "- Map raw fragments to concise search concepts such as species names, evolution families, move names, regions, routes, held items, and badges.\n"
+                "- Good examples: Evolution Families, Fire Type Moves, Regional Locations, Held Items, Gym Leaders, Legendary Pokemon."
+            )
+        if domain == "literature":
+            return (
+                "Dataset-specific guidance for Harry Potter fiction data:\n"
+                "- Good child labels are characters, places, magical objects, spells, events, relationships, institutions, or chapter-like scene clues.\n"
+                "- Reject generic narration and metadata such as Chapter, Book, Page, Said, Asked, Looked, First, and Items when they appear alone.\n"
+                "- Map raw fragments to concise fictional-world concepts such as named characters, rooms, artifacts, battles, lessons, and discoveries.\n"
+                "- Good examples: Hogwarts Locations, Magical Objects, Character Conflicts, Ministry Events, Classroom Scenes, Horcrux Clues."
             )
         return (
             "General guidance:\n"
@@ -388,6 +418,8 @@ class TTEA(KnowExAttack):
         if self._dataset_domain() == "enron" and (lowered in metadata or lowered in {"ect", "ena", "enron", "corp", "inc"}):
             return True
         if self._dataset_domain() == "health" and lowered in {"doctor", "dr", "gp", "florida", "navarre", "background"}:
+            return True
+        if normalize_anchor(label, self._dataset_domain()) is None:
             return True
         return False
     def _parse_taxonomy_children(self, raw: str):
@@ -676,7 +708,8 @@ class TTEA(KnowExAttack):
     def _node_utility(self, node: TaxonomyNode, query_id: int) -> float:
         exploration_bonus = self.ucb_c * math.sqrt(math.log(1 + max(1, query_id)) / (1 + node.visits))
         entropy = self._sibling_entropy(node)
-        return node.avg_reward + exploration_bonus + self.lambda_prior * node.posterior + self.gamma_entropy * entropy
+        frontier_bonus = self.frontier_anchor_boost if self.use_frontier_anchors and node.frontier_anchors else 0.0
+        return node.avg_reward + exploration_bonus + self.lambda_prior * node.posterior + self.gamma_entropy * entropy + frontier_bonus
 
     def _sibling_entropy(self, node: TaxonomyNode) -> float:
         if not node.parent:
@@ -691,23 +724,70 @@ class TTEA(KnowExAttack):
         return node.parent is not None and self.nodes[node.parent].status in {"active", "mature"}
 
     def _can_exploit(self, node: TaxonomyNode) -> bool:
-        return node.status == "mature" and len(node.anchors) > 0
+        return node.status == "mature" and len(self._normalized_anchor_pool(node.anchors, node)) > 0
 
-    def _generate_probe_query(self, node: TaxonomyNode) -> str:
-        return (
+    def _generate_probe_query(self, node: TaxonomyNode) -> Tuple[str, Optional[str]]:
+        frontier_anchor = self._pop_frontier_anchor(node)
+        if frontier_anchor:
+            support = []
+            seen_support = {frontier_anchor.lower()}
+            for anchor in node.frontier_anchors:
+                cleaned = normalize_anchor(anchor, self._dataset_domain())
+                if not cleaned or cleaned.lower() in seen_support:
+                    continue
+                support.append(cleaned)
+                seen_support.add(cleaned.lower())
+                if len(support) >= 2:
+                    break
+            support_text = f" Related frontier hints: {', '.join(support)}." if support else ""
+            query = (
+                f"Within {node.label}, use the frontier anchor '{frontier_anchor}' as the main search center."
+                f"{support_text} Expand outward from that anchor to nearby facts, named entities, dates, places, "
+                "terminology, examples, and adjacent context. Prefer concrete retrieved details over generic background."
+            )
+            return query, frontier_anchor
+
+        query = (
             f"I am researching {node.label}. Please provide a concise but concrete overview focused on "
             f"{node.description} Include named entities, dates, examples, terminology, and specific details "
             "when available. If there are relevant retrieved passages, preserve their distinctive factual content."
         )
+        return query, None
 
     def _generate_exploitation_query(self, node: TaxonomyNode) -> Tuple[str, str]:
-        anchor = random.choice(node.anchors)
+        anchors = self._normalized_anchor_pool(node.anchors, node)
+        anchor = random.choice(anchors) if anchors else node.label
         query = (
             f"Within the topic {node.label}, focus specifically on '{anchor}'. "
             "Please retrieve and summarize concrete surrounding facts, related entities, timelines, and adjacent details. "
             "Prefer specific content over generic background."
         )
         return query, anchor
+
+    def _pop_frontier_anchor(self, node: TaxonomyNode) -> Optional[str]:
+        if not self.use_frontier_anchors:
+            return None
+        while node.frontier_anchors:
+            anchor = node.frontier_anchors.pop(0)
+            normalized = normalize_anchor(anchor, self._dataset_domain())
+            if normalized:
+                return normalized
+        return None
+
+    def _normalized_anchor_pool(self, anchors: Iterable[str], node: TaxonomyNode) -> List[str]:
+        if not self.normalize_exploit_anchors:
+            return [a for a in anchors if a]
+        normalized = []
+        seen = set()
+        for anchor in anchors:
+            cleaned = normalize_anchor(anchor, self._dataset_domain())
+            if not cleaned or cleaned.lower() in seen:
+                continue
+            if cleaned.lower() in self._ancestor_labels(node):
+                continue
+            normalized.append(cleaned)
+            seen.add(cleaned.lower())
+        return normalized
 
     def _wrap_attack_query(self, info_query: str) -> str:
         if "<info>" in self.attack_template:
@@ -814,6 +894,23 @@ class TTEA(KnowExAttack):
             doc_id = self._doc_id(doc)
             if doc_id is not None:
                 history.add(doc_id)
+                self.global_retrieval_ids.add(doc_id)
+
+    def _new_retrieved_docs(self, node_id: str, retrieved_docs):
+        docs = retrieved_docs or []
+        fresh = []
+        for doc in docs:
+            doc_id = self._doc_id(doc)
+            if doc_id is None or doc_id not in self.global_retrieval_ids:
+                fresh.append(doc)
+        return fresh
+
+    def _doc_text(self, doc) -> str:
+        if isinstance(doc, tuple) and doc:
+            return self._doc_text(doc[0])
+        if isinstance(doc, dict):
+            return str(doc.get("content") or doc.get("page_content") or doc.get("text") or "")
+        return str(getattr(doc, "page_content", "") or getattr(doc, "text", "") or "")
 
     def _recent_reward_mean(self, node: TaxonomyNode) -> float:
         window = max(1, self.expand_reward_window)
@@ -871,49 +968,42 @@ class TTEA(KnowExAttack):
             self.expand_retire_parent,
             ",".join(reason) or "visit_gate",
         )
+    def _extract_frontier_anchors(self, retrieved_docs, node: TaxonomyNode) -> List[str]:
+        texts = [self._doc_text(doc) for doc in retrieved_docs or []]
+        existing = list(node.anchors) + list(node.frontier_anchors)
+        return extract_anchors_from_texts(
+            texts,
+            domain=self._dataset_domain(),
+            max_anchors=self.frontier_anchors_per_round,
+            existing=existing,
+        )
+
     def _extract_anchors(self, chunks: Iterable[str], node: TaxonomyNode) -> List[str]:
-        text = "\n".join(chunks)
-        if not text:
-            return []
-
-        phrase_candidates = re.findall(r"\b(?:[A-Z][a-zA-Z0-9&.-]+\s+){0,4}[A-Z][a-zA-Z0-9&.-]+\b", text)
-        term_candidates = re.findall(r"\b[a-zA-Z][a-zA-Z0-9-]{4,}\b", text.lower())
-        stopwords = {
-            "about", "after", "again", "available", "because", "before", "being", "could", "details", "during",
-            "focused", "general", "include", "please", "provide", "relevant", "retrieved", "should", "specific",
-            "their", "there", "these", "those", "through", "within", "would", "which", "while",
-        }
-
-        counts: Dict[str, int] = {}
-        for cand in phrase_candidates:
-            cand = cand.strip(" .,:;()[]{}\"'")
-            if 3 <= len(cand) <= 80 and cand.lower() not in stopwords:
-                if self._dataset_domain() in {"enron", "health"} and self._is_noisy_child_label(cand):
-                    continue
-                counts[cand] = counts.get(cand, 0) + 3
-        for cand in term_candidates:
-            if cand not in stopwords and len(cand) <= 40:
-                if self._dataset_domain() in {"enron", "health"} and self._is_noisy_child_label(cand):
-                    continue
-                counts[cand] = counts.get(cand, 0) + 1
-
-        ranked = sorted(counts, key=lambda c: (counts[c], len(c)), reverse=True)
-        fresh = []
-        existing = {a.lower() for a in node.anchors}
-        for cand in ranked:
-            if cand.lower() not in existing:
-                fresh.append(cand)
-            if len(fresh) >= self.max_anchors:
-                break
-        return fresh
+        return extract_anchors_from_texts(
+            chunks,
+            domain=self._dataset_domain(),
+            max_anchors=self.max_anchors,
+            existing=node.anchors,
+        )
 
     def _merge_anchors(self, node: TaxonomyNode, anchors: Iterable[str]):
         existing = {a.lower() for a in node.anchors}
         for anchor in anchors:
-            if anchor.lower() not in existing:
-                node.anchors.append(anchor)
-                existing.add(anchor.lower())
+            cleaned = normalize_anchor(anchor, self._dataset_domain())
+            if cleaned and cleaned.lower() not in existing:
+                node.anchors.append(cleaned)
+                existing.add(cleaned.lower())
         node.anchors = node.anchors[: self.max_anchors]
+
+    def _merge_frontier_anchors(self, node: TaxonomyNode, anchors: Iterable[str]):
+        existing = {a.lower() for a in node.frontier_anchors}
+        existing.update(a.lower() for a in node.anchors)
+        for anchor in anchors:
+            cleaned = normalize_anchor(anchor, self._dataset_domain())
+            if cleaned and cleaned.lower() not in existing:
+                node.frontier_anchors.append(cleaned)
+                existing.add(cleaned.lower())
+        node.frontier_anchors = node.frontier_anchors[: max(self.max_anchors, self.frontier_anchors_per_round)]
 
     def _update_node_status(self, node: TaxonomyNode):
         if node.visits >= self.min_mature_visits and node.avg_shift < self.prune_threshold and node.avg_reward == 0:
@@ -997,7 +1087,7 @@ class TTEA(KnowExAttack):
         return labels
     def _domain_anchor_child_specs(self, node: TaxonomyNode) -> List[dict]:
         domain = self._dataset_domain()
-        if domain not in {"enron", "health"}:
+        if domain not in {"enron", "health", "pokemon", "literature"}:
             return []
         if domain == "enron":
             buckets = [
@@ -1011,7 +1101,7 @@ class TTEA(KnowExAttack):
                 ("People and Departments", "Named employees, teams, departments, reporting lines, and organizational roles.", ["enron", "corp", "department", "team", "manager", "employee", "director", "vp"]),
             ]
             defaults = ["Executive Communications", "Energy Trading", "Legal Investigations", "Risk Management"]
-        else:
+        elif domain == "health":
             buckets = [
                 ("Symptoms and Complaints", "Patient symptoms, chief complaints, severity, duration, and symptom progression.", ["pain", "fever", "rash", "cough", "bleeding", "swelling", "ache", "symptom", "complaint", "dizzy", "nausea"]),
                 ("Diagnosis and Differential", "Diagnoses, differential diagnosis, clinical history, doctor assessment, and suspected conditions.", ["diagnosis", "diagnostic", "history", "condition", "disease", "illness", "clinical", "interview", "assessment"]),
@@ -1024,6 +1114,27 @@ class TTEA(KnowExAttack):
                 ("Healthcare Access", "Insurance, Medicare, doctors, appointments, referrals, location, and access to care.", ["doctor", "medicare", "insurance", "appointment", "referral", "clinic", "hospital", "access", "gp"]),
             ]
             defaults = ["Symptoms and Complaints", "Diagnosis and Differential", "Medication and Dosage", "Procedures and Surgery"]
+        elif domain == "pokemon":
+            buckets = [
+                ("Species and Forms", "Pokemon species, regional forms, legendary or mythical Pokemon, and named creature variants.", ["species", "form", "mega", "gigantamax", "legendary", "mythical", "pikachu", "charizard", "eevee"]),
+                ("Moves and Abilities", "Moves, abilities, hidden abilities, status effects, battle techniques, and move-learning details.", ["move", "ability", "attack", "beam", "punch", "slash", "dance", "hidden", "status"]),
+                ("Types and Matchups", "Elemental types, type combinations, weaknesses, resistances, and matchup details.", ["type", "fire", "water", "grass", "electric", "psychic", "dragon", "fairy", "steel", "ghost"]),
+                ("Locations and Regions", "Regions, routes, towns, cities, caves, gyms, landmarks, and encounter locations.", ["route", "city", "town", "cave", "forest", "region", "island", "gym", "league"]),
+                ("Evolution and Breeding", "Evolution chains, evolution items, levels, friendship, breeding, eggs, and forms.", ["evolve", "evolution", "stone", "level", "friendship", "egg", "breed", "baby"]),
+                ("Items and Badges", "Held items, key items, berries, stones, balls, badges, TMs, HMs, and equipment.", ["item", "berry", "stone", "ball", "badge", "tm", "hm", "held"]),
+                ("Trainers and Teams", "Trainers, rivals, gym leaders, champions, villain teams, companions, and organizations.", ["trainer", "leader", "champion", "rival", "team", "ash", "brock", "misty"]),
+            ]
+            defaults = ["Species and Forms", "Moves and Abilities", "Types and Matchups", "Locations and Regions"]
+        else:
+            buckets = [
+                ("Characters and Relationships", "Named characters, family ties, friendships, rivalries, dialogue, and recurring roles.", ["harry", "ron", "hermione", "dumbledore", "snape", "voldemort", "weasley", "malfoy"]),
+                ("Places and Institutions", "Fictional locations, rooms, schools, ministries, houses, shops, and organizations.", ["hogwarts", "hall", "tower", "forest", "chamber", "ministry", "diagon", "azkaban"]),
+                ("Magical Objects", "Wands, potions, books, maps, relics, horcruxes, cloaks, cups, stones, and enchanted items.", ["wand", "potion", "map", "cloak", "stone", "cup", "horcrux", "book", "sword"]),
+                ("Spells and Magic", "Spells, charms, curses, rituals, magical rules, classes, and magical concepts.", ["spell", "charm", "curse", "patronus", "lesson", "class", "magic", "potion"]),
+                ("Plot Events", "Scenes, conflicts, battles, discoveries, escapes, trials, and chapter-like narrative clues.", ["battle", "escape", "trial", "attack", "discovery", "lesson", "feast", "tournament"]),
+                ("Creatures and Beings", "Magical creatures, ghosts, house-elves, dragons, dementors, and non-human beings.", ["dragon", "dementor", "elf", "goblin", "ghost", "phoenix", "creature"]),
+            ]
+            defaults = ["Characters and Relationships", "Places and Institutions", "Magical Objects", "Plot Events"]
 
         scores: Dict[str, int] = {}
         evidence: Dict[str, List[str]] = {}
@@ -1040,7 +1151,13 @@ class TTEA(KnowExAttack):
                     evidence.setdefault(bucket_label, []).append(label)
                     matched = True
             if not matched:
-                fallback = "People and Departments" if domain == "enron" else "Diagnosis and Differential"
+                fallback_by_domain = {
+                    "enron": "People and Departments",
+                    "health": "Diagnosis and Differential",
+                    "pokemon": "Species and Forms",
+                    "literature": "Characters and Relationships",
+                }
+                fallback = fallback_by_domain.get(domain, defaults[0])
                 scores[fallback] = scores.get(fallback, 0) + 1
                 evidence.setdefault(fallback, []).append(label)
 

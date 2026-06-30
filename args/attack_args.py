@@ -45,6 +45,12 @@ def get_attack_args(p, attack):
             "--ak_exploit_temperature", dest="ak.exploit_temperature", default=0.7, type=float, help="Temperature for exploitation generation in CopyBreak")
         p.add_argument(
             "--ak_num_of_each_reason", dest="ak.num_of_reason", default=3, type=int, help="Number of each back/forward reasoning queries to generate per anchor chunk in CopyBreak")
+        p.add_argument(
+            "--ak_anchor_domain", dest="ak.anchor_domain", default="auto", choices=["auto", "enron", "health", "pokemon", "literature", "general"], type=str, help="Domain used for CopyBreak exploit anchor normalization")
+        p.add_argument(
+            "--ak_normalize_exploit_anchors", dest="ak.normalize_exploit_anchors", default=True, action="store_true", help="Normalize CopyBreak exploit anchor chunks before reasoning-query generation")
+        p.add_argument(
+            "--ak_no_normalize_exploit_anchors", dest="ak.normalize_exploit_anchors", action="store_false", help="Use raw CopyBreak exploit anchor chunks")
         
     elif attack == "IKEA":
         p.add_argument(
@@ -163,6 +169,18 @@ def get_attack_args(p, attack):
             "--ak_expand_anchor_fallback", dest="ak.expand_anchor_fallback", default=True, action="store_true", help="Use extracted anchors as child nodes when dynamic taxonomy split returns no children")
         p.add_argument(
             "--ak_no_expand_anchor_fallback", dest="ak.expand_anchor_fallback", action="store_false", help="Disable anchor-based child fallback for early expansion")
+        p.add_argument(
+            "--ak_use_frontier_anchors", dest="ak.use_frontier_anchors", default=True, action="store_true", help="Use anchors extracted from newly retrieved docs to center the next TTEA probe query")
+        p.add_argument(
+            "--ak_no_use_frontier_anchors", dest="ak.use_frontier_anchors", action="store_false", help="Disable frontier-anchor-centered TTEA probe queries")
+        p.add_argument(
+            "--ak_frontier_anchors_per_round", dest="ak.frontier_anchors_per_round", default=4, type=int, help="Maximum frontier anchors extracted from newly retrieved docs per TTEA round")
+        p.add_argument(
+            "--ak_frontier_anchor_boost", dest="ak.frontier_anchor_boost", default=0.35, type=float, help="Scheduler utility boost for TTEA nodes with queued frontier anchors")
+        p.add_argument(
+            "--ak_normalize_exploit_anchors", dest="ak.normalize_exploit_anchors", default=True, action="store_true", help="Normalize and filter TTEA exploit anchors before generating leaf exploitation queries")
+        p.add_argument(
+            "--ak_no_normalize_exploit_anchors", dest="ak.normalize_exploit_anchors", action="store_false", help="Use raw TTEA exploit anchors")
     elif attack == "RandomText":
         p.add_argument(
             "--ak_llm_model", dest="ak.llm_model", default="gpt4o-mini", type=str, help="LLM model for RandomText attack")

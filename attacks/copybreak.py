@@ -13,6 +13,7 @@ from langchain_core.prompts import ChatPromptTemplate
 import pandas as pd
 
 from .base import KnowExAttack
+from .anchor_utils import normalized_anchor_focus, resolve_anchor_domain
 from tools.attacks import extract_indexes, detect_refusal
 from tools.get_embedding import get_embedding
 from tools.get_llm import get_llm
@@ -61,6 +62,13 @@ class CopyBreak(KnowExAttack):
         
         self.exploit_template = args.exploit_template # for generate head and tail based on anchor chunk
         self.exploit_temp = args.exploit_temperature
+        configured_anchor_domain = getattr(args, "anchor_domain", "auto")
+        self.anchor_domain = configured_anchor_domain if configured_anchor_domain != "auto" else resolve_anchor_domain(
+            getattr(args, "dataset", ""),
+            getattr(args, "topic_word", ""),
+            getattr(args, "taxonomy_preset", ""),
+        )
+        self.normalize_exploit_anchors = getattr(args, "normalize_exploit_anchors", True)
         
         
         prompt_dir = os.environ.get("PROMPT_PATH")
@@ -143,8 +151,9 @@ class CopyBreak(KnowExAttack):
         anchor_chunk = random.sample(list(self.unexploited_chunks), 1)[0]
         self.unexploited_chunks.remove(anchor_chunk)
 
+        exploit_chunk = self._normalized_exploit_chunk(anchor_chunk)
         prompt = ChatPromptTemplate.from_template(self.exploit_template).format(\
-            num=self.num_of_reason, num_total=2*self.num_of_reason, num_tokens=self.num_of_reason*50, chunk=anchor_chunk)
+            num=self.num_of_reason, num_total=2*self.num_of_reason, num_tokens=self.num_of_reason*50, chunk=exploit_chunk)
         
         message = [{"role": "user", "content": prompt}]
         response = self.attack_llm(message, temperature=self.exploit_temp)
@@ -154,6 +163,15 @@ class CopyBreak(KnowExAttack):
         for rq in reasonings_queries:
             self.reasoning_queries.put(rq)
         return self._exploitation() 
+
+    def _normalized_exploit_chunk(self, anchor_chunk: str) -> str:
+        if not self.normalize_exploit_anchors:
+            return anchor_chunk
+        focus = normalized_anchor_focus(anchor_chunk, domain=self.anchor_domain, max_anchors=5)
+        if not focus:
+            return anchor_chunk
+        logging.info("Exploitation: normalized anchor focus=%s", focus)
+        return f"Clean semantic focus anchors: {focus}\n\nSource chunk:\n{anchor_chunk}"
 
     def _parse_exploit_response(self, response):
         """Output format 1. ...\n2. ...\n3. ..."""

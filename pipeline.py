@@ -57,6 +57,10 @@ def pipeline(args):
     rag = getattr(rags, args.rag)(args.rg)
     rag.index_content(dataset)
     
+    # Share run-level context with attack-specific args for domain-aware schedulers.
+    setattr(args.ak, "dataset", args.dataset)
+    setattr(args.ak, "rag", args.rag)
+
     # get attack method
     attack = getattr(attacks, args.attack)(args.ak)
     # get recorder
