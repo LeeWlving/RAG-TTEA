@@ -326,12 +326,16 @@ class TTEA(KnowExAttack):
         if parsed:
             return parsed
 
-        # Fallback for models that ignore the JSON-only instruction.
-        lines = [line.strip(" -0123456789.:\t") for line in raw.splitlines()]
+        # Fallback for models that ignore the JSON-only instruction. Avoid
+        # treating JSON field fragments such as '"label": ...' as node names.
+        lines = [line.strip(" -0123456789.:,\t\"'") for line in raw.splitlines()]
         for line in lines:
             if not line or len(line) > 160:
                 continue
-            if "{" in line or "}" in line or "[" in line or "]" in line:
+            lowered = line.lower()
+            if any(ch in line for ch in "{}[]"):
+                continue
+            if "label" in lowered or "description" in lowered or lowered in {"children", "child", "name", "desc"}:
                 continue
             parsed.append({"label": line, "description": line})
             if len(parsed) >= self.llm_taxonomy_children:
