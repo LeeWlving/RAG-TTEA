@@ -19,3 +19,4 @@ __pycache__/
 *.csv
 *.jsonl
 .DS_Store
+papra.tex
