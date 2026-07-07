@@ -87,6 +87,7 @@ class TTEA(KnowExAttack):
         self.llm_taxonomy_children = args.llm_taxonomy_children
         self.max_depth = args.max_depth
         self.max_children = args.max_children
+        self.beam_width = max(1, getattr(args, "beam_width", 3))
         self.max_anchors = args.max_anchors
         self.temperature = args.temperature
 
@@ -109,6 +110,7 @@ class TTEA(KnowExAttack):
         self.expand_retire_parent = getattr(args, "expand_retire_parent", True)
         self.expand_generate_leaf_children = getattr(args, "expand_generate_leaf_children", True)
         self.expand_anchor_fallback = getattr(args, "expand_anchor_fallback", True)
+        self.beam_refine_min_visits = max(1, getattr(args, "beam_refine_min_visits", 1))
         self.use_frontier_anchors = getattr(args, "use_frontier_anchors", True)
         self.frontier_anchors_per_round = getattr(args, "frontier_anchors_per_round", 4)
         self.frontier_anchor_boost = getattr(args, "frontier_anchor_boost", 0.35)
@@ -210,6 +212,7 @@ class TTEA(KnowExAttack):
         self._merge_frontier_anchors(node, frontier_anchors)
         self._merge_anchors(node, list(frontier_anchors) + list(anchors))
         self._update_node_status(node)
+        self._maybe_refine_beam_node(node)
         self._maybe_expand_node(node, reward, node_repeat_at_k)
         self._backpropagate(node, shift, reward)
         self._update_sibling_posteriors(node.parent)
@@ -685,10 +688,24 @@ class TTEA(KnowExAttack):
             if node.node_id == self.root_id or node.status not in {"active", "mature"}:
                 continue
             mode = "exploit" if self._can_exploit(node) else "explore"
-            candidates.append((self._node_utility(node, query_id), node, mode))
+            utility = self._node_utility(node, query_id)
+            if self._is_in_retained_beam(node, query_id):
+                beam_score = utility + self._beam_path_bonus(node, query_id)
+                candidates.append((beam_score, utility, node, mode))
 
         if not candidates:
-            if not self.nodes[self.root_id].children:
+            fallback = []
+            for node in self.nodes.values():
+                if node.node_id == self.root_id or node.status not in {"active", "mature"}:
+                    continue
+                mode = "exploit" if self._can_exploit(node) else "explore"
+                utility = self._node_utility(node, query_id)
+                fallback.append((utility, utility, node, mode))
+
+            if fallback:
+                candidates = fallback
+                logging.warning("TTEA beam had no schedulable nodes; falling back to all active/mature nodes.")
+            elif not self.nodes[self.root_id].children:
                 logging.warning("TTEA has no schedulable taxonomy nodes; injecting static root children.")
                 for child in self._default_taxonomy().get("children", [])[: self.max_children]:
                     self._add_node_from_spec(child, parent=self.root_id, depth=1)
@@ -698,11 +715,23 @@ class TTEA(KnowExAttack):
                         text = f"{child.label}. {child.description}"
                         child.prototype = np.array(self.attack_emb._embed(text))
                 self._activate_initial_nodes()
-            root_child = self.nodes[self.nodes[self.root_id].children[0]]
-            return root_child, "explore"
+                root_child = self.nodes[self.nodes[self.root_id].children[0]]
+                return root_child, "explore"
+
+            if not candidates:
+                root_child = self.nodes[self.nodes[self.root_id].children[0]]
+                return root_child, "explore"
+
         candidates.sort(key=lambda item: item[0], reverse=True)
-        utility, node, mode = candidates[0]
-        logging.info("TTEA scheduler utility=%.4f for node=%s mode=%s", utility, node.node_id, mode)
+        beam_score, utility, node, mode = candidates[0]
+        logging.info(
+            "TTEA scheduler utility=%.4f beam_score=%.4f beam_width=%d for node=%s mode=%s",
+            utility,
+            beam_score,
+            self.beam_width,
+            node.node_id,
+            mode,
+        )
         return node, mode
 
     def _node_utility(self, node: TaxonomyNode, query_id: int) -> float:
@@ -710,6 +739,58 @@ class TTEA(KnowExAttack):
         entropy = self._sibling_entropy(node)
         frontier_bonus = self.frontier_anchor_boost if self.use_frontier_anchors and node.frontier_anchors else 0.0
         return node.avg_reward + exploration_bonus + self.lambda_prior * node.posterior + self.gamma_entropy * entropy + frontier_bonus
+
+    def _retained_beam_children(self, parent: TaxonomyNode, query_id: int) -> List[str]:
+        children = [
+            self.nodes[child_id]
+            for child_id in parent.children
+            if self.nodes[child_id].status != "pruned"
+        ]
+        if not children:
+            return []
+
+        children.sort(
+            key=lambda child: (
+                child.posterior,
+                self._node_utility(child, query_id),
+                -child.visits,
+                child.node_id,
+            ),
+            reverse=True,
+        )
+        return [child.node_id for child in children[: self.beam_width]]
+
+    def _is_in_retained_beam(self, node: TaxonomyNode, query_id: int) -> bool:
+        child = node
+        while child.parent is not None:
+            parent = self.nodes[child.parent]
+            retained = self._retained_beam_children(parent, query_id)
+            if retained and child.node_id not in retained:
+                return False
+            child = parent
+        return True
+
+    def _beam_path_bonus(self, node: TaxonomyNode, query_id: int) -> float:
+        log_term = math.log(1 + max(1, query_id))
+        if log_term <= 0:
+            return 0.0
+
+        bonuses = []
+        child = node
+        while child.parent is not None:
+            visits = self._subtree_visits(child.node_id)
+            bonuses.append(math.sqrt(log_term / (1 + visits)))
+            child = self.nodes[child.parent]
+        if not bonuses:
+            return 0.0
+        return self.ucb_c * float(sum(bonuses) / len(bonuses))
+
+    def _subtree_visits(self, node_id: str) -> int:
+        node = self.nodes[node_id]
+        total = node.visits
+        for child_id in node.children:
+            total += self._subtree_visits(child_id)
+        return total
 
     def _sibling_entropy(self, node: TaxonomyNode) -> float:
         if not node.parent:
@@ -967,6 +1048,33 @@ class TTEA(KnowExAttack):
             activated,
             self.expand_retire_parent,
             ",".join(reason) or "visit_gate",
+        )
+
+    def _maybe_refine_beam_node(self, node: TaxonomyNode):
+        if node.node_id == self.root_id or node.depth >= self.max_depth or node.expanded_once:
+            return
+        if node.status == "pruned" or node.visits < self.beam_refine_min_visits:
+            return
+        if not self._is_in_retained_beam(node, self.query_round):
+            return
+
+        activated = self._activate_children(node, allow_dynamic_split=self.expand_generate_leaf_children)
+        if not node.children and self.expand_anchor_fallback:
+            activated = self._activate_anchor_children(node)
+        if not node.children:
+            return
+
+        node.expanded_once = True
+        if self.expand_retire_parent:
+            node.status = "saturated"
+        logging.info(
+            "TTEA beam-refined node=%s label='%s' visits=%d activated_children=%d retired_parent=%s beam_width=%d",
+            node.node_id,
+            node.label,
+            node.visits,
+            activated,
+            self.expand_retire_parent,
+            self.beam_width,
         )
     def _extract_frontier_anchors(self, retrieved_docs, node: TaxonomyNode) -> List[str]:
         texts = [self._doc_text(doc) for doc in retrieved_docs or []]

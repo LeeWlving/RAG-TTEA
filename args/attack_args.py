@@ -122,6 +122,10 @@ def get_attack_args(p, attack):
         p.add_argument(
             "--ak_max_children", dest="ak.max_children", default=8, type=int, help="Maximum children per taxonomy node loaded by TTEA")
         p.add_argument(
+            "--ak_beam_width", dest="ak.beam_width", default=3, type=int, help="Number of high-posterior children retained per taxonomy level for TTEA beam scheduling")
+        p.add_argument(
+            "--ak_beam_refine_min_visits", dest="ak.beam_refine_min_visits", default=1, type=int, help="Minimum visits before a retained TTEA beam node is refined into children")
+        p.add_argument(
             "--ak_max_anchors", dest="ak.max_anchors", default=12, type=int, help="Maximum anchors cached per mature TTEA leaf")
         p.add_argument(
             "--ak_temperature", dest="ak.temperature", default=0.4, type=float, help="Reserved generation temperature for TTEA")
